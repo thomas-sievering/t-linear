@@ -54,6 +54,14 @@ func run(argv []string) error {
 		return runUpdate(args)
 	case "comment":
 		return runComment(args)
+	case "comments":
+		return runComments(args)
+	case "comment-update":
+		return runCommentUpdate(args)
+	case "states":
+		return runStates(args)
+	case "state-create":
+		return runStateCreate(args)
 	case "graphql":
 		return runGraphQL(args)
 	default:
@@ -508,6 +516,200 @@ func runComment(args []string) error {
 	return printJSON(result)
 }
 
+func runComments(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: t-linear comments <identifier>")
+	}
+	identifier := args[0]
+
+	issueID, err := resolveIssueID(identifier)
+	if err != nil {
+		return err
+	}
+
+	q := `query($id: String!) {
+		issue(id: $id) {
+			comments {
+				nodes {
+					id body
+					user { id name }
+					createdAt updatedAt
+				}
+			}
+		}
+	}`
+
+	data, err := gql(q, map[string]any{"id": issueID})
+	if err != nil {
+		return err
+	}
+
+	var issue struct {
+		Comments struct {
+			Nodes []struct {
+				ID        string `json:"id"`
+				Body      string `json:"body"`
+				User      *struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"user"`
+				CreatedAt string `json:"createdAt"`
+				UpdatedAt string `json:"updatedAt"`
+			} `json:"nodes"`
+		} `json:"comments"`
+	}
+	if err := gqlField(data, "issue", &issue); err != nil {
+		return err
+	}
+
+	normalized := make([]map[string]any, len(issue.Comments.Nodes))
+	for i, c := range issue.Comments.Nodes {
+		entry := map[string]any{
+			"id":         c.ID,
+			"body":       c.Body,
+			"created_at": c.CreatedAt,
+			"updated_at": c.UpdatedAt,
+		}
+		if c.User != nil {
+			entry["user"] = map[string]any{"id": c.User.ID, "name": c.User.Name}
+		}
+		normalized[i] = entry
+	}
+	return printJSON(normalized)
+}
+
+func runCommentUpdate(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: t-linear comment-update <comment-id> <body>")
+	}
+	commentID := args[0]
+	body := strings.Join(args[1:], " ")
+
+	q := `mutation($id: String!, $input: CommentUpdateInput!) {
+		commentUpdate(id: $id, input: $input) {
+			success
+			comment { id body updatedAt }
+		}
+	}`
+
+	data, err := gql(q, map[string]any{
+		"id":    commentID,
+		"input": map[string]any{"body": body},
+	})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success bool `json:"success"`
+		Comment any  `json:"comment"`
+	}
+	if err := gqlField(data, "commentUpdate", &result); err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
+func runStates(args []string) error {
+	fs := flag.NewFlagSet("states", flag.ContinueOnError)
+	team := fs.String("team", "", "team key (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *team == "" {
+		return fmt.Errorf("--team is required")
+	}
+
+	data, err := gql(`query($key: String!) {
+		teams(filter: { key: { eq: $key } }) {
+			nodes {
+				states {
+					nodes { id name type position color description }
+				}
+			}
+		}
+	}`, map[string]any{"key": *team})
+	if err != nil {
+		return err
+	}
+	var teams struct {
+		Nodes []struct {
+			States struct {
+				Nodes []any `json:"nodes"`
+			} `json:"states"`
+		} `json:"nodes"`
+	}
+	if err := gqlField(data, "teams", &teams); err != nil {
+		return err
+	}
+	if len(teams.Nodes) == 0 {
+		return fmt.Errorf("team %q not found", *team)
+	}
+	return printJSON(teams.Nodes[0].States.Nodes)
+}
+
+func runStateCreate(args []string) error {
+	fs := flag.NewFlagSet("state-create", flag.ContinueOnError)
+	team := fs.String("team", "", "team key (required)")
+	name := fs.String("name", "", "state name (required)")
+	stateType := fs.String("type", "", "state type: backlog|unstarted|started|completed|canceled|triage (required)")
+	color := fs.String("color", "#95a2b3", "hex color")
+	desc := fs.String("description", "", "state description")
+	position := fs.Float64("position", -1, "sort position within type category")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *team == "" || *name == "" || *stateType == "" {
+		return fmt.Errorf("--team, --name, and --type are required")
+	}
+
+	validTypes := map[string]bool{
+		"backlog": true, "unstarted": true, "started": true,
+		"completed": true, "canceled": true, "triage": true,
+	}
+	if !validTypes[*stateType] {
+		return fmt.Errorf("invalid --type %q — must be one of: backlog, unstarted, started, completed, canceled, triage", *stateType)
+	}
+
+	teamID, err := resolveTeamID(*team)
+	if err != nil {
+		return err
+	}
+
+	input := map[string]any{
+		"teamId": teamID,
+		"name":   *name,
+		"type":   *stateType,
+		"color":  *color,
+	}
+	if *desc != "" {
+		input["description"] = *desc
+	}
+	if *position >= 0 {
+		input["position"] = *position
+	}
+
+	q := `mutation($input: WorkflowStateCreateInput!) {
+		workflowStateCreate(input: $input) {
+			success
+			workflowState { id name type position color description }
+		}
+	}`
+
+	data, err := gql(q, map[string]any{"input": input})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success       bool `json:"success"`
+		WorkflowState any  `json:"workflowState"`
+	}
+	if err := gqlField(data, "workflowStateCreate", &result); err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func runGraphQL(args []string) error {
 	fs := flag.NewFlagSet("graphql", flag.ContinueOnError)
 	query := fs.String("query", "", "GraphQL query string")
@@ -879,6 +1081,12 @@ func printUsage() {
 	fmt.Println("  update <ID> [--state S] [--priority N]")
 	fmt.Println("              [--title T] [--assignee EMAIL]")
 	fmt.Println("  comment <ID> <text>                  Add comment")
+	fmt.Println("  comments <ID>                        List comments on issue")
+	fmt.Println("  comment-update <CID> <body>          Update a comment by ID")
+	fmt.Println("  states --team KEY                    List workflow states")
+	fmt.Println("  state-create --team KEY --name N     Create workflow state")
+	fmt.Println("               --type T [--color HEX]")
+	fmt.Println("               [--description D] [--position N]")
 	fmt.Println("  graphql [--query Q] [--vars JSON]    Raw GraphQL")
 	fmt.Println("  version                              Print version")
 	fmt.Println()

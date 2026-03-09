@@ -1,2 +1,13 @@
 *.exe
+*.out
+dist/
+build/
+tokens/
+*.log
 .env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

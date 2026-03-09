@@ -5,8 +5,10 @@ CLI for [Linear.app](https://linear.app) — query and manage issues, projects, 
 ## Install
 
 ```bash
-go install .
+go install github.com/thomas-sievering/t-linear@latest
 ```
+
+Requires Go 1.23+.
 
 ## Auth
 
@@ -28,6 +30,8 @@ t-linear <command> [flags]
 | `create --team KEY --title T [--description D] [--project SLUG] [--priority N] [--label L]` | Create issue |
 | `update <ID> [--state S] [--priority N] [--title T] [--assignee EMAIL]` | Update issue |
 | `comment <ID> <text>` | Add comment to issue |
+| `comments <ID>` | List comments on issue |
+| `comment-update <CID> <body>` | Update a comment |
 | `states --team KEY` | List workflow states |
 | `state-create --team KEY --name N --type T [--color HEX] [--description D] [--position N]` | Create workflow state |
 | `graphql [--query Q] [--vars JSON]` | Run raw GraphQL (reads stdin if no `--query`) |
@@ -48,6 +52,9 @@ t-linear update ENG-42 --state Done
 # Add a comment
 t-linear comment ENG-42 "Deployed to staging"
 
+# List comments on an issue
+t-linear comments ENG-42
+
 # Raw GraphQL
 echo '{ viewer { id name } }' | t-linear graphql
 ```
@@ -59,3 +66,7 @@ echo '{ viewer { id name } }' | t-linear graphql
 | `LINEAR_API_KEY` | API key (required) |
 | `T_LINEAR_PRETTY=1` | Pretty-print JSON output |
 | `T_LINEAR_ENVELOPE=1` | Wrap output in `{"ok":true,"data":...}` envelope |
+
+## License
+
+[MIT](LICENSE)
