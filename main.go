@@ -58,10 +58,18 @@ func run(argv []string) error {
 		return runComments(args)
 	case "comment-update":
 		return runCommentUpdate(args)
+	case "labels":
+		return runLabels(args)
+	case "label-create":
+		return runLabelCreate(args)
 	case "states":
 		return runStates(args)
 	case "state-create":
 		return runStateCreate(args)
+	case "state-archive":
+		return runStateArchive(args)
+	case "upload":
+		return runUpload(args)
 	case "graphql":
 		return runGraphQL(args)
 	default:
@@ -419,6 +427,8 @@ func runUpdate(args []string) error {
 	priority := fs.Int("priority", -1, "new priority (0=none, 1=urgent, 2=high, 3=medium, 4=low)")
 	title := fs.String("title", "", "new title")
 	assignee := fs.String("assignee", "", "assignee email")
+	addLabel := fs.String("add-label", "", "label name(s) to add, comma-separated")
+	removeLabel := fs.String("remove-label", "", "label name(s) to remove, comma-separated")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -450,8 +460,17 @@ func runUpdate(args []string) error {
 		input["assigneeId"] = userID
 	}
 
+	// Handle label add/remove: fetch current labels, compute new set
+	if *addLabel != "" || *removeLabel != "" {
+		newLabelIDs, err := computeLabelUpdate(identifier, issueID, *addLabel, *removeLabel)
+		if err != nil {
+			return err
+		}
+		input["labelIds"] = newLabelIDs
+	}
+
 	if len(input) == 0 {
-		return fmt.Errorf("no updates specified — use --state, --priority, --title, or --assignee")
+		return fmt.Errorf("no updates specified — use --state, --priority, --title, --assignee, --add-label, or --remove-label")
 	}
 
 	q := `mutation($id: String!, $input: IssueUpdateInput!) {
@@ -460,6 +479,7 @@ func runUpdate(args []string) error {
 			issue {
 				id identifier title url
 				state { name }
+				labels { nodes { name } }
 			}
 		}
 	}`
@@ -476,6 +496,97 @@ func runUpdate(args []string) error {
 		return err
 	}
 	return printJSON(result)
+}
+
+// computeLabelUpdate fetches the issue's current labels and the team's available labels,
+// then computes the new label ID set after adding/removing the specified labels.
+func computeLabelUpdate(identifier, issueID, addStr, removeStr string) ([]string, error) {
+	// Fetch the issue's current label IDs and team's available labels in one query
+	data, err := gql(`query($id: String!) {
+		issue(id: $id) {
+			labels { nodes { id name } }
+			team {
+				labels { nodes { id name } }
+			}
+		}
+	}`, map[string]any{"id": issueID})
+	if err != nil {
+		return nil, err
+	}
+
+	var issue struct {
+		Labels struct {
+			Nodes []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"nodes"`
+		} `json:"labels"`
+		Team struct {
+			Labels struct {
+				Nodes []struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"nodes"`
+			} `json:"labels"`
+		} `json:"team"`
+	}
+	if err := gqlField(data, "issue", &issue); err != nil {
+		return nil, err
+	}
+
+	// Build team label name→ID map
+	teamLabelMap := map[string]string{}
+	for _, l := range issue.Team.Labels.Nodes {
+		teamLabelMap[strings.ToLower(l.Name)] = l.ID
+	}
+
+	// Start with current label IDs
+	labelSet := map[string]bool{}
+	for _, l := range issue.Labels.Nodes {
+		labelSet[l.ID] = true
+	}
+
+	// Add labels
+	if addStr != "" {
+		for _, name := range strings.Split(addStr, ",") {
+			name = strings.TrimSpace(name)
+			id, ok := teamLabelMap[strings.ToLower(name)]
+			if !ok {
+				return nil, fmt.Errorf("label %q not found in team — available: %s", name, availableLabelNames(issue.Team.Labels.Nodes))
+			}
+			labelSet[id] = true
+		}
+	}
+
+	// Remove labels
+	if removeStr != "" {
+		for _, name := range strings.Split(removeStr, ",") {
+			name = strings.TrimSpace(name)
+			id, ok := teamLabelMap[strings.ToLower(name)]
+			if !ok {
+				// Label doesn't exist in team — silently skip removal
+				continue
+			}
+			delete(labelSet, id)
+		}
+	}
+
+	ids := make([]string, 0, len(labelSet))
+	for id := range labelSet {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func availableLabelNames(labels []struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}) string {
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Name
+	}
+	return strings.Join(names, ", ")
 }
 
 func runComment(args []string) error {
@@ -609,6 +720,93 @@ func runCommentUpdate(args []string) error {
 	return printJSON(result)
 }
 
+func runLabels(args []string) error {
+	fs := flag.NewFlagSet("labels", flag.ContinueOnError)
+	team := fs.String("team", "", "team key (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *team == "" {
+		return fmt.Errorf("--team is required")
+	}
+
+	data, err := gql(`query($key: String!) {
+		teams(filter: { key: { eq: $key } }) {
+			nodes {
+				labels {
+					nodes { id name color description }
+				}
+			}
+		}
+	}`, map[string]any{"key": *team})
+	if err != nil {
+		return err
+	}
+	var teams struct {
+		Nodes []struct {
+			Labels struct {
+				Nodes []any `json:"nodes"`
+			} `json:"labels"`
+		} `json:"nodes"`
+	}
+	if err := gqlField(data, "teams", &teams); err != nil {
+		return err
+	}
+	if len(teams.Nodes) == 0 {
+		return fmt.Errorf("team %q not found", *team)
+	}
+	return printJSON(teams.Nodes[0].Labels.Nodes)
+}
+
+func runLabelCreate(args []string) error {
+	fs := flag.NewFlagSet("label-create", flag.ContinueOnError)
+	team := fs.String("team", "", "team key (required)")
+	name := fs.String("name", "", "label name (required)")
+	color := fs.String("color", "#95a2b3", "hex color")
+	desc := fs.String("description", "", "label description")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *team == "" || *name == "" {
+		return fmt.Errorf("--team and --name are required")
+	}
+
+	teamID, err := resolveTeamID(*team)
+	if err != nil {
+		return err
+	}
+
+	input := map[string]any{
+		"teamId": teamID,
+		"name":   *name,
+		"color":  *color,
+	}
+	if *desc != "" {
+		input["description"] = *desc
+	}
+
+	q := `mutation($input: IssueLabelCreateInput!) {
+		issueLabelCreate(input: $input) {
+			success
+			issueLabel { id name color }
+		}
+	}`
+
+	data, err := gql(q, map[string]any{"input": input})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success    bool `json:"success"`
+		IssueLabel any  `json:"issueLabel"`
+	}
+	if err := gqlField(data, "issueLabelCreate", &result); err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func runStates(args []string) error {
 	fs := flag.NewFlagSet("states", flag.ContinueOnError)
 	team := fs.String("team", "", "team key (required)")
@@ -708,6 +906,171 @@ func runStateCreate(args []string) error {
 		return err
 	}
 	return printJSON(result)
+}
+
+func runStateArchive(args []string) error {
+	fs := flag.NewFlagSet("state-archive", flag.ContinueOnError)
+	team := fs.String("team", "", "team key (required)")
+	name := fs.String("name", "", "state name to archive (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *team == "" || *name == "" {
+		return fmt.Errorf("--team and --name are required")
+	}
+
+	// Fetch team states to find the ID
+	data, err := gql(`query($key: String!) {
+		teams(filter: { key: { eq: $key } }) {
+			nodes {
+				states {
+					nodes { id name }
+				}
+			}
+		}
+	}`, map[string]any{"key": *team})
+	if err != nil {
+		return err
+	}
+	var teams struct {
+		Nodes []struct {
+			States struct {
+				Nodes []struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"nodes"`
+			} `json:"states"`
+		} `json:"nodes"`
+	}
+	if err := gqlField(data, "teams", &teams); err != nil {
+		return err
+	}
+	if len(teams.Nodes) == 0 {
+		return fmt.Errorf("team %q not found", *team)
+	}
+
+	lower := strings.ToLower(*name)
+	var stateID string
+	for _, s := range teams.Nodes[0].States.Nodes {
+		if strings.ToLower(s.Name) == lower {
+			stateID = s.ID
+			break
+		}
+	}
+	if stateID == "" {
+		return fmt.Errorf("state %q not found in team %s", *name, *team)
+	}
+
+	archiveData, err := gql(`mutation($id: String!) {
+		workflowStateArchive(id: $id) {
+			success
+		}
+	}`, map[string]any{"id": stateID})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err := gqlField(archiveData, "workflowStateArchive", &result); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{
+		"success": result.Success,
+		"name":    *name,
+		"id":      stateID,
+	})
+}
+
+func runUpload(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: t-linear upload <file>")
+	}
+	filePath := args[0]
+
+	// Read file
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	// Determine content type from extension
+	ext := strings.ToLower(filePath)
+	if i := strings.LastIndex(ext, "."); i >= 0 {
+		ext = ext[i:]
+	}
+	contentTypes := map[string]string{
+		".png":  "image/png",
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif":  "image/gif",
+		".webp": "image/webp",
+		".svg":  "image/svg+xml",
+	}
+	contentType, ok := contentTypes[ext]
+	if !ok {
+		return fmt.Errorf("unsupported file type %q — supported: png, jpg, jpeg, gif, webp, svg", ext)
+	}
+
+	// Extract filename from path
+	filename := filePath
+	if i := strings.LastIndexAny(filename, "/\\"); i >= 0 {
+		filename = filename[i+1:]
+	}
+
+	// Step 1: Request upload URL from Linear
+	q := `mutation($contentType: String!, $filename: String!, $size: Int!) {
+		fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+			uploadFile {
+				uploadUrl
+				assetUrl
+			}
+		}
+	}`
+
+	data, err := gql(q, map[string]any{
+		"contentType": contentType,
+		"filename":    filename,
+		"size":        len(fileData),
+	})
+	if err != nil {
+		return err
+	}
+
+	var result struct {
+		UploadFile struct {
+			UploadURL string `json:"uploadUrl"`
+			AssetURL  string `json:"assetUrl"`
+		} `json:"uploadFile"`
+	}
+	if err := gqlField(data, "fileUpload", &result); err != nil {
+		return err
+	}
+
+	// Step 2: PUT the file to the upload URL
+	req, err := http.NewRequest("PUT", result.UploadFile.UploadURL, bytes.NewReader(fileData))
+	if err != nil {
+		return fmt.Errorf("create upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Cache-Control", "public, max-age=31536000")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upload HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	return printJSON(map[string]any{
+		"asset_url": result.UploadFile.AssetURL,
+		"filename":  filename,
+	})
 }
 
 func runGraphQL(args []string) error {
@@ -1080,13 +1443,20 @@ func printUsage() {
 	fmt.Println("         [--priority N] [--label L]")
 	fmt.Println("  update <ID> [--state S] [--priority N]")
 	fmt.Println("              [--title T] [--assignee EMAIL]")
+	fmt.Println("              [--add-label L] [--remove-label L]")
 	fmt.Println("  comment <ID> <text>                  Add comment")
 	fmt.Println("  comments <ID>                        List comments on issue")
 	fmt.Println("  comment-update <CID> <body>          Update a comment by ID")
+	fmt.Println("  labels --team KEY                    List team labels")
+	fmt.Println("  label-create --team KEY --name N     Create label")
+	fmt.Println("               [--color HEX]")
+	fmt.Println("               [--description D]")
 	fmt.Println("  states --team KEY                    List workflow states")
 	fmt.Println("  state-create --team KEY --name N     Create workflow state")
 	fmt.Println("               --type T [--color HEX]")
 	fmt.Println("               [--description D] [--position N]")
+	fmt.Println("  state-archive --team KEY --name N    Archive workflow state")
+	fmt.Println("  upload <file>                        Upload image, return asset URL")
 	fmt.Println("  graphql [--query Q] [--vars JSON]    Raw GraphQL")
 	fmt.Println("  version                              Print version")
 	fmt.Println()
