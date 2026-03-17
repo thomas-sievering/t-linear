@@ -202,8 +202,8 @@ func runProjects(args []string) error {
 		return err
 	}
 
-	q := `query($filter: ProjectFilter) {
-		projects(filter: $filter) {
+	q := `query {
+		projects {
 			nodes {
 				id name slugId state
 				teams { nodes { key } }
@@ -211,30 +211,44 @@ func runProjects(args []string) error {
 		}
 	}`
 
-	var vars map[string]any
-	if *team != "" {
-		vars = map[string]any{
-			"filter": map[string]any{
-				"accessibleTeams": map[string]any{
-					"some": map[string]any{
-						"key": map[string]any{"eq": *team},
-					},
-				},
-			},
-		}
-	}
-
-	data, err := gql(q, vars)
+	data, err := gql(q, nil)
 	if err != nil {
 		return err
 	}
+
+	type projectNode struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		SlugID string `json:"slugId"`
+		State  string `json:"state"`
+		Teams  struct {
+			Nodes []struct {
+				Key string `json:"key"`
+			} `json:"nodes"`
+		} `json:"teams"`
+	}
 	var projects struct {
-		Nodes []any `json:"nodes"`
+		Nodes []projectNode `json:"nodes"`
 	}
 	if err := gqlField(data, "projects", &projects); err != nil {
 		return err
 	}
-	return printJSON(projects.Nodes)
+
+	// Filter client-side by team key if specified
+	result := projects.Nodes
+	if *team != "" {
+		filtered := make([]projectNode, 0)
+		for _, p := range projects.Nodes {
+			for _, t := range p.Teams.Nodes {
+				if t.Key == *team {
+					filtered = append(filtered, p)
+					break
+				}
+			}
+		}
+		result = filtered
+	}
+	return printJSON(result)
 }
 
 func runIssues(args []string) error {
