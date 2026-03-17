@@ -216,7 +216,9 @@ func runProjects(args []string) error {
 		vars = map[string]any{
 			"filter": map[string]any{
 				"accessibleTeams": map[string]any{
-					"key": map[string]any{"eq": *team},
+					"some": map[string]any{
+						"key": map[string]any{"eq": *team},
+					},
 				},
 			},
 		}
